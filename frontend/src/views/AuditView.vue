@@ -10,30 +10,38 @@
         </button>
       </div>
     </div>
+    <div v-if="errorMsg" class="error-banner">{{ errorMsg }}</div>
     <div v-if="result" class="result-section">
-      <div class="score-card" :class="scoreClass">
-        <div class="score-label">安全评分</div>
-        <div class="score-value">{{ result.score }}</div>
-        <div class="score-grade">{{ scoreGrade }}</div>
-      </div>
-      <div class="vulnerabilities">
-        <h3>发现漏洞 ({{ result.vulnerabilities.length }})</h3>
-        <div v-for="v in result.vulnerabilities" :key="v.line + v.type" class="vuln-card" :class="v.severity">
-          <div class="vuln-header">
-            <span class="vuln-type">{{ v.type }}</span>
-            <span class="vuln-severity">{{ v.severity }}</span>
+      <template v-if="result.status === 'success'">
+        <div class="score-card" :class="scoreClass">
+          <div class="score-label">安全评分</div>
+          <div class="score-value">{{ result.score }}</div>
+          <div class="score-grade">{{ scoreGrade }}</div>
+        </div>
+        <div class="result-meta">审计时间：{{ formatTime(result.timestamp) }}（结果已保存，可在“审计历史”中随时查看）</div>
+        <div class="vulnerabilities">
+          <h3>发现漏洞 ({{ result.vulnerabilities.length }})</h3>
+          <div v-for="v in result.vulnerabilities" :key="v.line + v.type" class="vuln-card" :class="v.severity">
+            <div class="vuln-header">
+              <span class="vuln-type">{{ v.type }}</span>
+              <span class="vuln-severity">{{ v.severity }} · 第 {{ v.line }} 行</span>
+            </div>
+            <div class="vuln-desc">{{ v.description }}</div>
+            <div class="vuln-suggest">建议: {{ v.suggestion }}</div>
           </div>
-          <div class="vuln-desc">{{ v.description }}</div>
-          <div class="vuln-suggest">建议: {{ v.suggestion }}</div>
         </div>
-      </div>
-      <div v-if="result.gasIssues.length > 0" class="gas-section">
-        <h3>Gas优化建议</h3>
-        <div v-for="g in result.gasIssues" :key="g.functionName" class="gas-card">
-          <div class="gas-fn">{{ g.functionName }}</div>
-          <div class="gas-info">当前: {{ g.currentGas }} → 优化后: {{ g.optimizedGas }} ({{ Math.round((1-g.optimizedGas/g.currentGas)*100) }}%节省)</div>
-          <div class="gas-suggest">{{ g.suggestion }}</div>
+        <div v-if="result.gasIssues.length > 0" class="gas-section">
+          <h3>Gas优化建议</h3>
+          <div v-for="g in result.gasIssues" :key="g.functionName" class="gas-card">
+            <div class="gas-fn">{{ g.functionName }}</div>
+            <div class="gas-info">当前: {{ g.currentGas }} → 优化后: {{ g.optimizedGas }} ({{ Math.round((1-g.optimizedGas/g.currentGas)*100) }}%节省)</div>
+            <div class="gas-suggest">{{ g.suggestion }}</div>
+          </div>
         </div>
+      </template>
+      <div v-else class="failed-card">
+        <h3>审计失败</h3>
+        <div class="failed-reason">{{ result.error }}</div>
       </div>
     </div>
   </div>
@@ -41,17 +49,21 @@
 
 <script setup lang="ts">
 import { ref, computed } from "vue"
+import { useAuditStore } from "@/store"
+import type { AuditRecord } from "@/types"
+
+const store = useAuditStore()
 
 const contractCode = ref(`// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 contract SimpleBank {
     mapping(address => uint) public balances;
-    
+
     function deposit() public payable {
         balances[msg.sender] += msg.value;
     }
-    
+
     function withdraw(uint amount) public {
         require(balances[msg.sender] >= amount);
         (bool success,) = msg.sender.call{value: amount}("");
@@ -61,57 +73,41 @@ contract SimpleBank {
 }`)
 const filename = ref("SimpleBank.sol")
 const isAuditing = ref(false)
-const result = ref<any>(null)
+const result = ref<AuditRecord | null>(null)
+const errorMsg = ref("")
 
 const scoreClass = computed(() => {
-  if (!result.value) return ""
+  if (!result.value || result.value.score == null) return ""
   if (result.value.score >= 80) return "score-high"
   if (result.value.score >= 50) return "score-medium"
   return "score-low"
 })
 
 const scoreGrade = computed(() => {
-  if (!result.value) return ""
+  if (!result.value || result.value.score == null) return ""
   if (result.value.score >= 90) return "Excellent"
   if (result.value.score >= 70) return "Good"
   if (result.value.score >= 50) return "Fair"
   return "Poor"
 })
 
+function formatTime(ts: string) {
+  return ts ? ts.replace("T", " ").slice(0, 19) : ""
+}
+
 async function runAudit() {
   isAuditing.value = true
-  await new Promise(r => setTimeout(r, 1500))
-  
-  // Simulate vulnerability detection
-  const vulns = []
-  if (contractCode.value.includes("msg.sender.call")) {
-    vulns.push({
-      type: "重入攻击 (Reentrancy)",
-      severity: "critical",
-      line: contractCode.value.split("\n").findIndex(l => l.includes("msg.sender.call")) + 1,
-      description: "使用了低级的 call() 接收ETH，存在重入攻击风险。攻击者可通过恶意合约反复调用提款函数。",
-      suggestion: "使用 Checks-Effects-Interactions 模式，或使用 ReentrancyGuard 修饰符。"
-    })
+  errorMsg.value = ""
+  result.value = null
+  try {
+    result.value = await store.uploadAndAudit(contractCode.value, filename.value || "contract.sol")
+  } catch (err: any) {
+    // 后端审计失败：展示其保留的原始失败原因
+    errorMsg.value = err.message
+    result.value = store.currentResult
+  } finally {
+    isAuditing.value = false
   }
-  if (contractCode.value.includes("require(balances")) {
-    vulns.push({
-      type: "整数溢出 (Integer Overflow)",
-      severity: "high",
-      line: 1,
-      description: "Solidity 0.8以下版本未启用溢出检查，需注意。",
-      suggestion: "使用 SafeMath 库或在 Solidity 0.8+ 环境中编译。"
-    })
-  }
-  
-  result.value = {
-    score: vulns.length === 0 ? 95 : Math.max(20, 85 - vulns.length * 25),
-    vulnerabilities: vulns,
-    gasIssues: [
-      { functionName: "deposit()", currentGas: 45000, optimizedGas: 21000, suggestion: "移除不必要的存储写入" },
-      { functionName: "withdraw()", currentGas: 52000, optimizedGas: 31000, suggestion: "使用 local 变量缓存 balances[msg.sender]" }
-    ]
-  }
-  isAuditing.value = false
 }
 </script>
 
@@ -123,6 +119,11 @@ async function runAudit() {
 .btn-primary { background: #8b5cf6; color: white; border: none; padding: 0.625rem 1.5rem; border-radius: 8px; cursor: pointer; white-space: nowrap; }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 .result-section { margin-top: 2rem; }
+.result-meta { color: #6b7280; font-size: 0.875rem; margin-bottom: 1rem; }
+.error-banner { background: #fee2e2; color: #991b1b; border-radius: 8px; padding: 0.75rem 1rem; margin-top: 1rem; }
+.failed-card { background: white; border-radius: 12px; padding: 1.5rem; border-left: 4px solid #dc2626; }
+.failed-card h3 { color: #dc2626; margin-bottom: 0.75rem; }
+.failed-reason { color: #374151; font-family: monospace; white-space: pre-wrap; }
 .score-card { border-radius: 16px; padding: 2rem; text-align: center; color: white; margin-bottom: 2rem; }
 .score-high { background: linear-gradient(135deg, #10b981, #059669); }
 .score-medium { background: linear-gradient(135deg, #f59e0b, #d97706); }

@@ -1,155 +1,192 @@
+import hashlib
+import os
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional
-import re
-import uuid
-import random
-from datetime import datetime
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
 
-app = FastAPI(title="Smart Contract Security Auditor")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+from . import auditor, database
 
-# Vulnerability patterns
-VULNERABILITY_PATTERNS = [
-    {
-        "type": "重入攻击 (Reentrancy)",
-        "severity": "critical",
-        "pattern": r"\.call\{[^}]*value:\s*[^}]*\}\([^)]*\)",
-        "description": "使用低级call()或send()转移ETH存在重入攻击风险。攻击者可部署恶意合约在fallback中反复调用提款。",
-        "suggestion": "使用Checks-Effects-Interactions模式，或引入ReentrancyGuard。推荐使用transfer()或call()并限制Gas。"
-    },
-    {
-        "type": "整数溢出 (Integer Overflow/Underflow)",
-        "severity": "high",
-        "pattern": r"[+\-*/]\s*=|(&&|\|\|)\s*\w+\s*[<>=]",
-        "description": "Solidity 0.7及以下版本，未使用SafeMath时可能发生整数溢出。",
-        "suggestion": "使用SafeMath库或升级到Solidity 0.8+（内置溢出检查）。"
-    },
-    {
-        "type": "未授权访问控制",
-        "severity": "high",
-        "pattern": r"function\s+\w+\s*\([^)]*\)\s*public\s*(payable)?\s*\{[^}]*(?:require|if)\s*\(",
-        "description": "关键函数缺少访问控制检查，任何人都可以调用。",
-        "suggestion": "添加onlyOwner或自定义访问控制修饰符。"
-    },
-    {
-        "type": "selfdestruct使用",
-        "severity": "medium",
-        "pattern": r"selfdestruct|suicide",
-        "description": "selfdestruct可强制将合约所有ETH发送到任意地址，可能被滥用。",
-        "suggestion": "谨慎使用selfdestruct，确保有正当的业务需求。"
-    },
-    {
-        "type": "tx.origin钓鱼",
-        "severity": "high",
-        "pattern": r"tx\.origin",
-        "description": "使用tx.origin进行身份验证可能被钓鱼攻击，攻击者诱导用户触发交易。",
-        "suggestion": "使用msg.sender代替tx.origin进行身份验证。"
-    },
-    {
-        "type": "精确度损失",
-        "severity": "medium",
-        "pattern": r"/\s*\d+",
-        "description": "除法运算可能导致精度损失，特别是在代币金额计算中。",
-        "suggestion": "先乘后除，使用高精度计算或使用Babylonian方法。"
-    },
-]
+# 同一份合约在该时间窗口内重复提交时，沿用上一次的审计结论，不重复记录
+DEDUP_WINDOW_SECONDS = 3600
 
-GAS_PATTERNS = [
-    {"function": "storage_read", "issue": "循环中读取storage变量", "saving": 0.3},
-    {"function": "redundant_sstore", "issue": "不必要的storage写入", "saving": 0.25},
-    {"function": "short_circuit", "issue": "逻辑运算可短路优化", "saving": 0.15},
-]
+REPORTS_DIR = os.environ.get(
+    "AUDIT_REPORTS_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports"),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    database.init_db()
+    yield
+
+
+app = FastAPI(title="Smart Contract Security Auditor", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class AuditRequest(BaseModel):
     code: str
     filename: str
 
-def detect_vulnerabilities(code: str) -> List[dict]:
-    """Scan code for vulnerability patterns"""
-    lines = code.split("\n")
-    vulnerabilities = []
-    
-    for vp in VULNERABILITY_PATTERNS:
-        matches = re.finditer(vp["pattern"], code, re.MULTILINE)
-        for m in matches:
-            line_num = code[:m.start()].count("\n") + 1
-            # Find context
-            context_start = max(0, line_num - 2)
-            context_end = min(len(lines), line_num + 2)
-            context = "\n".join(lines[context_start:context_end])
-            
-            vulnerabilities.append({
-                "type": vp["type"],
-                "severity": vp["severity"],
-                "line": line_num,
-                "description": vp["description"],
-                "suggestion": vp["suggestion"],
-                "code": context.strip()
-            })
-    
-    return vulnerabilities
-
-def compute_gas_issues(code: str) -> List[dict]:
-    """Analyze gas consumption issues"""
-    issues = []
-    functions = re.findall(r"function\s+(\w+)\s*\(", code)
-    for fn in functions:
-        base_gas = random.randint(20000, 60000)
-        issues.append({
-            "functionName": f"{fn}()",
-            "currentGas": base_gas,
-            "optimizedGas": int(base_gas * (0.7 + random.random() * 0.2)),
-            "suggestion": random.choice(["移除不必要的storage写入", "缓存storage变量到memory", "使用短路逻辑", "合并多个事件为一个"])
-        })
-    return issues
-
-def compute_security_score(vulnerabilities: List[dict]) -> int:
-    """Compute overall security score"""
-    if not vulnerabilities:
-        return 100
-    severity_weights = {"critical": 25, "high": 15, "medium": 8, "low": 3}
-    deduction = sum(severity_weights.get(v["severity"], 5) for v in vulnerabilities)
-    return max(0, 100 - deduction)
 
 @app.get("/")
 async def root():
     return {"message": "Smart Contract Security Auditor", "version": "1.0.0"}
 
+
 @app.get("/api/patterns")
 async def list_patterns():
-    return {"code": 0, "message": "success", "data": VULNERABILITY_PATTERNS}
+    return {"code": 0, "message": "success", "data": auditor.PATTERNS_FOR_DISPLAY}
+
 
 @app.post("/api/audit")
 async def audit_contract(request: AuditRequest):
-    vulnerabilities = detect_vulnerabilities(request.code)
-    gas_issues = compute_gas_issues(request.code)
-    score = compute_security_score(vulnerabilities)
-    
-    result = {
-        "id": str(uuid.uuid4()),
+    code_hash = hashlib.sha256(request.code.encode("utf-8")).hexdigest()
+
+    # 短时间内重复提交同一份合约：直接沿用上一次的结论，不产生新记录
+    cached = database.find_recent_success(code_hash, DEDUP_WINDOW_SECONDS)
+    if cached:
+        return {"code": 0, "message": "success", "data": cached}
+
+    audit_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
+    record = {
+        "id": audit_id,
         "filename": request.filename,
-        "score": score,
-        "vulnerabilities": vulnerabilities,
-        "gasIssues": gas_issues,
-        "timestamp": datetime.now().isoformat()
+        "codeHash": code_hash,
+        "code": request.code,
+        "timestamp": timestamp,
     }
-    
-    return {"code": 0, "message": "success", "data": result}
+
+    try:
+        result = auditor.run_audit(request.code)
+        record.update(
+            status="success",
+            score=result["score"],
+            vulnerabilities=result["vulnerabilities"],
+            gasIssues=result["gasIssues"],
+            error=None,
+        )
+        database.insert_audit(record)
+        # 从库中读回，保证响应与之后查询到的内容完全一致
+        return {"code": 0, "message": "success", "data": database.get_audit(audit_id)}
+    except Exception as exc:
+        # 审计中途失败：保留原始失败原因，落库并原样返回给调用方
+        error_msg = f"{type(exc).__name__}: {exc}"
+        record.update(
+            status="failed",
+            score=None,
+            vulnerabilities=[],
+            gasIssues=[],
+            error=error_msg,
+        )
+        try:
+            database.insert_audit(record)
+            saved = database.get_audit(audit_id)
+        except Exception:
+            saved = None
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": 500,
+                "message": error_msg,
+                "data": saved or database.public_view(record),
+            },
+        )
+
 
 @app.get("/api/history")
 async def get_history():
-    return {"code": 0, "message": "success", "data": []}
+    return {"code": 0, "message": "success", "data": database.list_audits()}
+
+
+@app.get("/api/audit/{audit_id}")
+async def get_audit_detail(audit_id: str):
+    record = database.get_audit(audit_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="审计记录不存在")
+    return {"code": 0, "message": "success", "data": record}
+
 
 @app.post("/api/report/{audit_id}")
 async def generate_report(audit_id: str):
-    """Generate PDF report"""
-    # Simplified report generation
-    return {"code": 0, "message": "success", "data": {"url": f"/api/reports/{audit_id}.pdf"}}
+    """基于已保存的审计记录生成 PDF 报告（内容与当时审计结论一致）。"""
+    record = database.get_audit(audit_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="审计记录不存在")
+    if record["status"] != "success":
+        raise HTTPException(
+            status_code=400, detail=f"该次审计失败，无法生成报告：{record['error']}"
+        )
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = os.path.join(REPORTS_DIR, f"{audit_id}.pdf")
+    _build_pdf(record, path)
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {"url": f"/api/reports/{audit_id}.pdf"},
+    }
+
+
+@app.get("/api/reports/{filename}")
+async def download_report(filename: str):
+    path = os.path.join(REPORTS_DIR, filename)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="报告不存在")
+    return FileResponse(path, media_type="application/pdf")
+
+
+def _build_pdf(record: dict, path: str) -> None:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    c = canvas.Canvas(path, pagesize=letter)
+    y = 750
+    c.setFont("STSong-Light", 18)
+    c.drawString(72, y, "智能合约安全审计报告")
+    y -= 36
+    c.setFont("STSong-Light", 12)
+    c.drawString(72, y, f"文件：{record['filename']}")
+    y -= 20
+    c.drawString(72, y, f"时间：{record['timestamp']}")
+    y -= 20
+    c.drawString(72, y, f"安全评分：{record['score']}")
+    y -= 32
+    c.drawString(72, y, f"发现漏洞（{len(record['vulnerabilities'])}）：")
+    y -= 20
+    c.setFont("STSong-Light", 10)
+    for v in record["vulnerabilities"]:
+        for line in (
+            f"[{v['severity']}] {v['type']} (行 {v['line']})",
+            f"    {v['description']}",
+            f"    建议：{v['suggestion']}",
+        ):
+            c.drawString(72, y, line)
+            y -= 16
+            if y < 72:
+                c.showPage()
+                c.setFont("STSong-Light", 10)
+                y = 750
+        y -= 4
+    c.save()
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
