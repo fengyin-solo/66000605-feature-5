@@ -234,3 +234,6 @@ sandbox/
 *.pid
 *.seed
 *.pid.lock
+
+# 审计结果 SQLite 库（运行时生成，重启后由本服务自行维护）
+backend/data/
